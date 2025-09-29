@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gradient Boosting Animation (Depth-2 trees)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 18px; }
+    #controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+    #plot { border:1px solid #ddd; background:#fff; }
+    label { font-size:14px; }
+    .muted { color:#666; font-size:13px; }
+  </style>
+</head>
+<body>
+  <h2>Gradient Boosting Demo — noisy cubic (depth-2 trees)</h2>
+  <div id="controls">
+    <label>Trees: <span id="treesVal">1</span></label>
+    <input id="trees" type="range" min="1" max="100" value="1" />
+    <label>Learning rate:
+      <select id="lr">
+        <option value="1">1.0</option>
+        <option value="0.5">0.5</option>
+        <option value="0.2" selected>0.2</option>
+        <option value="0.1">0.1</option>
+        <option value="0.05">0.05</option>
+        <option value="0.01">0.01</option>
+      </select>
+    </label>
+    <button id="regen">Regenerate data</button>
+  </div>
+
+  <canvas id="plot" width="800" height="450"></canvas>
+  <p class="muted">Note: Each "tree" here is a shallow regression tree with max depth = 2. The slider chooses how many trees are used in the final ensemble. The visual shows only the final ensemble prediction (no intermediate trees).</p>
+  <p class="muted"><strong>Order of operations reminder:</strong> Each new tree is fit to the residuals and then multiplied by the learning rate before being added to the current prediction. So: prediction := prediction + lr * tree_prediction.</p>
+
+  <script>
+  // Single-file gradient boosting demo (depth-2 regression trees)
+  // - generate noisy cubic points y = x^3 + noise (more compact range)
+  // - build shallow regression trees (max depth 2) sequentially on residuals
+  // - combine: pred = pred + lr * tree_pred (this is important ordering)
+
+  // Utilities
+  function randn_bm(){ // normal random ~N(0,1)
+    let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random();
+    return Math.sqrt(-2.0*Math.log(u))*Math.cos(2.0*Math.PI*v);
+  }
+
+  // Generate data
+  function generateData(n=150, xrange=[-1.6,1.6], noise=0.8){
+    const xs = []; const ys = [];
+    for(let i=0;i<n;i++){
+      const x = xrange[0] + Math.random()*(xrange[1]-xrange[0]);
+      const y = x*x*x + noise*randn_bm();
+      xs.push(x); ys.push(y);
+    }
+    return {xs, ys};
+  }
+
+  // Regression tree (very small, max depth 2) - implemented as recursive greedy binary splits on x only
+  // Node object: {isLeaf, value, featureSplit (x), left, right}
+  function fitTreeDepth2(xs, ys, idxs){
+    // idxs: indices to consider
+    function mean(indices){ if(indices.length===0) return 0; let s=0; for(const i of indices) s+=ys[i]; return s/indices.length; }
+
+    function variance(indices){ if(indices.length===0) return 0; const m=mean(indices); let s=0; for(const i of indices) { const d=ys[i]-m; s+=d*d; } return s; }
+
+    // find best split on x value to reduce variance
+    function bestSplit(indices){
+      if(indices.length<=4) return null;
+      // sort by x
+      const arr = indices.slice().sort((a,b)=>xs[a]-xs[b]);
+      let best = {score:Infinity, thresh:null, left:null, right:null};
+      for(let k=2;k<arr.length-2;k++){
+        const left = arr.slice(0,k); const right = arr.slice(k);
+        const s = variance(left)+variance(right);
+        if(s < best.score){ best = {score:s, thresh:(xs[arr[k-1]]+xs[arr[k]])/2, left, right}; }
+      }
+      return best.thresh===null?null:best;
+    }
+
+    // build root
+    const root = {};
+    const rootMean = mean(idxs);
+    const split = bestSplit(idxs);
+    if(!split){ root.isLeaf=true; root.value=rootMean; return root; }
+    root.isLeaf=false; root.split=split.thresh; root.value=rootMean;
+
+    // left child
+    const leftIndices = split.left; const rightIndices = split.right;
+    const leftMean = mean(leftIndices); const rightMean = mean(rightIndices);
+    // child splitting (depth 2) - attempt to further split left and right
+    function childNode(indices, m){
+      const b = bestSplit(indices);
+      if(!b){ return {isLeaf:true, value:m}; }
+      const node = {isLeaf:false, split:b.thresh, value: m};
+      // leaves at depth 2
+      const lmean = mean(b.left); const rmean = mean(b.right);
+      node.left = {isLeaf:true, value:lmean}; node.right={isLeaf:true, value:rmean};
+      return node;
+    }
+
+    root.left = childNode(leftIndices, leftMean);
+    root.right = childNode(rightIndices, rightMean);
+    return root;
+  }
+
+  function predictTree(tree, x){
+    let node = tree;
+    if(!node) return 0;
+    while(!node.isLeaf){
+      if(x <= node.split) node = node.left; else node = node.right;
+    }
+    return node.value;
+  }
+
+  // Fit sequence of trees (gradient boosting) on residuals
+  function fitGB(xs, ys, nTrees, lr){
+    const n = xs.length;
+    const preds = new Array(n).fill(0);
+    // initialize to mean (first 'tree' essentially predicts mean)
+    const mean0 = ys.reduce((a,b)=>a+b,0)/n;
+    for(let i=0;i<n;i++) preds[i]=mean0;
+    const trees = [];
+    for(let t=0;t<nTrees-1;t++){ // nTrees==1 -> no fitted trees, just mean
+      const residuals = ys.map((y,i)=>y - preds[i]);
+      // fit a depth-2 tree on residuals using x order but using residuals as ys
+      // reuse fitTreeDepth2 but temporarily pass residuals; easiest is to copy arrays
+      const tree = fitTreeDepth2(xs, residuals, xs.map((_,i)=>i));
+      // update preds
+      for(let i=0;i<n;i++) preds[i] += lr * predictTree(tree, xs[i]);
+      trees.push(tree);
+    }
+    return {mean0, trees, preds};
+  }
+
+  // Rendering utilities - simple coordinate transform
+  const canvas = document.getElementById('plot'); const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height, PAD=50;
+
+  function drawPlot(xs, ys, predFn){
+    // compute bounds
+    const xmin = Math.min(...xs), xmax = Math.max(...xs);
+    const ymin = Math.min(...ys), ymax = Math.max(...ys);
+    function sx(x){ return PAD + (x - xmin)/(xmax-xmin) * (W-2*PAD); }
+    function sy(y){ return H - PAD - (y - ymin)/(ymax-ymin) * (H-2*PAD); }
+
+    // clear
+    ctx.clearRect(0,0,W,H);
+    // axes
+    ctx.strokeStyle='#ddd'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(PAD, PAD); ctx.lineTo(PAD, H-PAD); ctx.lineTo(W-PAD, H-PAD); ctx.stroke();
+    // draw scatter
+    for(let i=0;i<xs.length;i++){
+      ctx.fillStyle='rgba(20,100,200,0.6)'; ctx.beginPath(); ctx.arc(sx(xs[i]), sy(ys[i]), 3, 0, 2*Math.PI); ctx.fill();
+    }
+
+    // draw prediction line - sample dense xs
+    const N=500; ctx.beginPath(); ctx.lineWidth=2; ctx.strokeStyle='crimson';
+    for(let i=0;i<N;i++){ const x = xmin + (i/(N-1))*(xmax-xmin); const y = predFn(x); const px=sx(x), py=sy(y); if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py); }
+    ctx.stroke();
+    // legend
+    ctx.fillStyle='#000'; ctx.font='12px sans-serif'; ctx.fillText('Scatter: noisy cubic', PAD, PAD-8); ctx.fillStyle='crimson'; ctx.fillText('Ensemble prediction', PAD+200, PAD-8);
+  }
+
+  // App wiring
+  // use generateData defaults (compact cubic range and smaller noise)
+  let data = generateData();
+  const treesEl = document.getElementById('trees'); const treesVal = document.getElementById('treesVal'); const lrEl = document.getElementById('lr'); const regen = document.getElementById('regen');
+
+  function update(){
+    const ntrees = parseInt(treesEl.value,10);
+    treesVal.textContent = ntrees;
+    const lr = parseFloat(lrEl.value);
+    // Fit model: when ntrees==1 show just mean line; when >1 build ntrees where the first is mean
+    const gb = fitGB(data.xs, data.ys, ntrees, lr);
+    const predFn = (x)=>{
+      // compute prediction from mean + sum of lr * tree(x)
+      let p = gb.mean0;
+      for(const tree of gb.trees) p += lr * predictTree(tree, x);
+      return p;
+    };
+    drawPlot(data.xs, data.ys, predFn);
+  }
+
+  treesEl.addEventListener('input', ()=>{ update(); });
+  lrEl.addEventListener('change', ()=>{ update(); });
+  regen.addEventListener('click', ()=>{ data = generateData(); update(); });
+
+  // initial draw
+  update();
+  </script>
+</body>
+</html>
